@@ -1,0 +1,719 @@
+---
+title: "Choosing Factors | Journal of Financial Economics, 2017 | Eugene Fama, Ken French"
+author: "Rohan Thanki, Akarsh Srivastava, Mayank, Jain"
+date: "09/15/2022"
+output: pdf_document
+classoption: a4paper
+
+header-includes:
+  \usepackage{float}
+  \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.width = 10,
+  fig.height = 6,
+  tidy.opts = list(width.cutoff = 100),
+  tidy = TRUE,
+  message = FALSE,
+  warning = FALSE
+  )
+```
+
+# Project Aim
+
+* 
+
+# Initial Setup
+
+## Loading libraries
+
+```{r}
+
+# libraries to read and write date to a file
+library(data.table)
+library(readxl)
+library(writexl)
+library(xlsx)
+
+# libraries to fetch data using APIs
+library(fredr)
+
+#libraries to wrangle data and perform analytics
+library(tidyverse)
+library(zoo)
+library(lubridate)
+library(stringr)
+library(ppsr)
+library(moments)
+library(sqldf)
+library(DescTools)
+library(naniar)
+library(PerformanceAnalytics)
+library(tidyquant)
+
+# libraries to plot data
+library(corrplot)
+```
+
+## Declaring Global Variables
+
+```{r}
+# Data path
+data_path = "../../Data/"
+
+# add this to a config file instead
+fredr_set_key("7a257e710452eb46c904661109420fe8")
+
+crsp_mkt_cap_threshold = 1000000 # actually this represents 1000 million since shares outstanding are in thousands
+crsp_price_threshold <- 5
+
+# this uses the hard-drive as an extended memory if the RAM is full
+invisible(utils::memory.limit(64000))
+```
+
+* Due to memory constraints, we will only load data of CUSIPS that are common to both CRSP and COMPUSTAT data
+* We have created this list in SAS and saved it as a CSV file
+
+# Data Preparation
+
+## Unique CUSIPS for consideration
+
+```{r}
+# compustat <- fread('data/compustat_funda_filtered.csv')
+# compustat_cusips <- compustat %>%
+#   rename(CUSIP = cusip) %>%
+#   mutate(CUSIP = substr(CUSIP, 1, 8)) %>% 
+#   select(CUSIP) %>% 
+#   unique()
+# 
+# crsp_msf <- fread('data/crsp_msf_filtered.csv')
+# crsp_msf_cusips <- crsp_msf %>%
+#   filter(SHRCD %in% c(10,11)) %>% 
+#   select(CUSIP) %>% 
+#   unique()
+# 
+# common_cusips <- compustat_cusips %>% 
+#   inner_join(crsp_msf_cusips, by = 'CUSIP')
+# 
+# write.csv(common_cusips, 'data/common_cusips.csv', row.names = FALSE)
+```
+
+```{r}
+# Selecting MSFT, AAPL, FORD
+# cusip_ids <- c('59491810', '03783310', '34537086')
+cusip_ids <- fread(paste0(data_path, "common_cusips.csv"))$CUSIP
+```
+
+## COMPUSTAT - Annual Data - Company Fundamentals
+
+* link - `https://www.marketplace.spglobal.com/en/datasets/compustat-fundamentals-(8)#:~:text=Compustat%20Fundamentals%20provides%20standardized%20North,on%20for%20over%2050%20years`
+
+Compustat Fundamentals provides standardized North American and global financial statement and market data for over 80,000 active and inactive publicly traded companies as far back as 1950 and point-in-time snapshots beginning in 1987. The dataset includes:
+
+* over 3,000 standardized annual, quarterly, year-to-date, and semi-annual financial items covering income statement, balance sheet, cash flow, segment (for North American companies), and ratio data
+* Industry specific data covering 12 industries*
+* Daily and monthly market data, including security pricing, dividends, and splits
+* Corporate Tracker providing corporate action and security identifier history
+* Point-in-time snapshot data for North American companies providing all changes to fundamental items and their associated point dates
+
+### Dealing with Look-Ahead Bias
+
+* Here, we need to deal with "look-ahead bias", i.e. we should not form our investment decisions based on information we do not have at that moment of time.
+* Since the COMPUSTAT data has companies whose fiscal years end at different months in the same year, we get the `Year` value from the `fyear` column. 
+* All portfolios except momentum portfolios are formed and re-balanced on 1st July each year. We use the fundamental data available for the previous year in forming these portfolios. For example,  data for `calendar year 2000` is used to form portfolios on `1st July 2001`.
+* Momentum portfolios are re-balanced on the 1st of each month.
+
+### Fundamental Varaible Computations
+
+#### Book Value of Equity
+
+* Book Value of Preferred Stock is the redemption value, the liquidation value or the par value in that order of data availability
+
+*   Total assets for the last fiscal year-end in calendar year t −1
+    - Liabilities
+    + Balance sheet deferred taxes and investment tax credit (if available)
+    - Book Value of Preferred Stock
+    ___________________________________________________________________________
+    = Book Value of Equity
+    
+#### Market Capitalization
+
+* Market equity (market cap) is price times shares outstanding at the end of December of t−1, from CRSP.
+
+#### Operating Profitability
+
+*   Revenues 
+    - Cost of goods sold
+    - Selling, general, and administrative expenses
+    - Interest expense
+    _________________________________________________________________________
+    = Operating Profit
+    
+* Operating Profitability = Operating Profit / Book Value of Equity
+    
+#### Cash Profitability
+
+*   Change in accounts receivable from t−2 to t−1
+    + Change in prepaid expenses
+    - Change in accounts payable
+    - Change in inventory
+    - Change in deferred revenue
+    - Change in accrued expenses
+    _________________________________________________________________________
+    = Accruals
+    
+* Cash Operating Profitability = (Operating Profit - Accruals) / Book Value of Equity
+
+#### Investment
+
+* This measures the rate of growth of total assets Year-on-Year
+* Investment = ((Total Assets in year t-1) / (Total Assets in year t-2)) - 1
+
+
+### Code
+
+```{r}
+compustat <- fread(paste0(data_path, "compustat_Dec_2022_download_cleaned.csv"), showProgress = FALSE)
+colnames_reqd <- c('cusip', 'fyear', 'pstkrv', 'pstkl', 'pstk', 'txditc', 'seq', 'sale', 'cogs', 'xsga', 'rect', 'invt', 'xpp', 'dlc', 'dltt', 'ap', 'xacc', 'at')
+
+compustat_w <- compustat %>% 
+  select(colnames_reqd) %>%
+  arrange(cusip, fyear) %>% 
+  mutate(cusip = substr(cusip, 1, 8)) %>%
+  filter(cusip %in% cusip_ids) %>% 
+  filter(!is.null(cusip)) %>%
+  rename(Funda_year = fyear, CUSIP = cusip) %>% 
+  select(CUSIP, Funda_year, everything()) %>%
+  distinct(CUSIP, Funda_year, .keep_all = TRUE) %>%
+  group_by(CUSIP) %>%
+  # fill(everything(), .direction = "downup") %>% 
+  mutate(
+    
+    # Book Value of Equity
+    BV_PREF = coalesce(pstkrv, pstkl, pstk, 0),
+    txditc = case_when(is.na(txditc) ~ 0,
+                       TRUE ~ txditc),
+    BV = seq + txditc - BV_PREF,
+    
+    # Gross Profitability (Accruals Based) - for RMW_A factor
+    Prof_Acc = (sale - cogs - xsga) / sale,
+    
+    # Gross Profitability (Cash Based) - for RMW_C factor
+    chg_rect = rect - lag(rect),
+    chg_invt = invt - lag(invt),
+    chg_xpp = xpp - lag(xpp),
+    chg_dlc = dlc - lag(dlc),
+    chg_dltt = dltt - lag(dltt),
+    chg_ap = ap - lag(ap),
+    chg_xacc = xacc - lag(xacc),
+    Prof_Cash = Prof_Acc - chg_rect - chg_invt - chg_xpp + (chg_dlc + chg_dltt) + chg_ap + chg_xacc,
+    # Prof_Cash = Prof_Acc,
+    
+    # Assets Growth - for CMA factor
+    at_growth = at/lag(at) - 1
+    ) %>% 
+  
+  # selecting only required columns
+  select(CUSIP, Funda_year, BV, Prof_Acc, Prof_Cash, at_growth)
+
+rm(compustat)
+```
+
+## CRSP Data
+
+* The Center for Research in Security Prices (CRSP) database contains end-of-day and month-end price on primary listings for the NYSE, NYSE MKT, NASDAQ, and Arca exchanges along with basic market indices. 
+* The CRSP_MSF data contains all end-of-month information on stocks from the CRSP over the period 1926 - Dec 2019
+
+### Dealing with Look-Ahead Bias
+
+Fix this based on the way the paper has implemented
+
+* Here, we need to deal with "look-ahead bias", i.e. we should not form our investment decisions based on information we do not have at that moment of time.
+* Since we mostly use the CRSP data to `compute returns`, we do not lag the data.
+* However, we do lag the `Market Cap` data by 1 month, since this is used to compute ratios that affect our investment decisions. For example, the `average market cap from December 2000 to November 2001` are used are used to form portfolios for `calendar year 2002`
+* This need not be the case for practical purposes, since market caps can be obtained in real time for most publicly traded stocks. However, since CRSP releases its data with a 1 month lag, we lag the market cap by 1 month in this case.
+
+### MSF Testing
+
+### Loading and Wrangling MSF Data
+
+```{r}
+# Loading Value Weighted Returns
+vwretd <- fread(paste0(data_path, "crsp_msf_filtered.csv"), showProgress = FALSE) %>%
+  rename(Date = DATE) %>%
+  select(Date, VWRETD) %>%
+  distinct() %>% 
+  mutate(Date = as.yearmon(ymd(Date)),
+         VWRETD = as.numeric(VWRETD)
+         ) %>% 
+  arrange(Date)
+```
+
+```{r}
+# Loading CRSP Monthly Data
+crsp_msf <- fread(paste0(data_path, "crsp_msf_filtered_v2.csv"), showProgress = FALSE) %>%
+  select(CUSIP, date, PRC, RET, SHROUT, SHRCD, EXCHCD) %>%
+  filter(CUSIP %in% cusip_ids, SHRCD %in% c(10,11), EXCHCD %in% c(1,2,3))
+
+# Account for Bankrupt Companies
+crsp_msf[crsp_msf$RET == 'B']$RET <- -1
+
+# Wrangling CRSP Monthly Data
+crsp_msf_w <- crsp_msf %>% 
+  rename(Date = date) %>%
+  select(Date, everything()) %>%
+  group_by(CUSIP) %>% 
+  fill(everything(), .direction = "downup") %>%  
+  mutate(Date = as.yearmon(ymd(Date)),
+         Year = year(Date),
+         RET = as.numeric(RET),
+         PRC = abs(PRC),
+         MKT_CAP = PRC * SHROUT,
+         Funda_year = case_when(month(Date) <= 6 ~ Year - 2,
+                           month(Date) > 6 ~ Year - 1,
+                           TRUE ~ NaN),
+    MOM_RET = rollapply(data=1+RET, width=11, FUN=prod, align='right', fill=NA),
+    MOM_RET = lag(MOM_RET, 2)
+    ) %>%
+  distinct(CUSIP, Date, .keep_all = TRUE) %>%
+  drop_na(RET) %>% 
+  select(-PRC,-SHROUT, -SHRCD) %>%
+  select(CUSIP, Date, Year, everything()) %>% 
+  arrange(CUSIP, Date) %>% 
+  inner_join(vwretd, by=c('Date'))
+
+rm(crsp_msf, vwretd)
+```
+
+### Extracting Market Cap of December End for Each Year for BV/MV Computation
+
+```{r}
+bvmv_mkt_cap <- crsp_msf_w %>% 
+  select(CUSIP, Date, MKT_CAP, Funda_year) %>% 
+  filter(month(Date)==12) %>% 
+  mutate(Funda_MKT_CAP = lag(MKT_CAP)) %>% 
+  select(CUSIP, Funda_year, Funda_MKT_CAP)
+```
+
+### Extracting Market Cap of June End for Each Year for Portfolio Construction & Rebalancing
+
+```{r}
+port_mkt_cap <- crsp_msf_w %>% 
+  select(CUSIP, Date, MKT_CAP, Funda_year) %>% 
+  filter(month(Date)==6) %>% 
+  mutate(Port_MKT_CAP = lag(MKT_CAP)) %>% 
+  select(CUSIP, Funda_year, Port_MKT_CAP)
+```
+
+## Risk Free Data From Fama French Research Factors
+
+```{r}
+risk_free <- fread(paste0(data_path, "F-F_Research_Data_Factors.csv"), 
+                   skip=3,
+                   showProgress = FALSE)
+risk_free_w <- risk_free %>% 
+  rename(Date = 1) %>% 
+  mutate(
+    RF = as.numeric(RF) / 100,
+    Date = as.yearmon(Date, "%Y%m")
+  ) %>% 
+  select(Date, RF)
+
+rm(risk_free)
+```
+
+## Combining COMPUSTAT, CRSP and Risk-Free Data
+
+```{r}
+crsp_compustat_combined <- crsp_msf_w %>%
+  inner_join(compustat_w, by = c('CUSIP', 'Funda_year')) %>%
+  inner_join(bvmv_mkt_cap, by = c('CUSIP', 'Funda_year')) %>%
+  inner_join(port_mkt_cap, by = c('CUSIP', 'Funda_year')) %>%
+  inner_join(risk_free_w, by='Date') %>% 
+  mutate(
+    BV_MV = BV / Funda_MKT_CAP,
+    Port_Start_Year = Funda_year + 1,
+    Port_MKT_CAP = lag(Port_MKT_CAP)
+    ) %>%
+  select(-Year, -Funda_year) %>% 
+  select(CUSIP, Date, Port_Start_Year, everything()) %>% 
+  ungroup()
+```
+
+`*************************************************************************************************************`
+
+# Generating Factor Portfolio Returns
+
+## Factor Mimicking Portfolio Criteria
+
+```{r}
+nyse_filtered_cutoffs <- crsp_compustat_combined %>%
+  select(Date, Port_MKT_CAP, BV_MV, EXCHCD) %>% 
+  filter(EXCHCD==1) %>% 
+  group_by(Date) %>% 
+  summarise(
+    size_cutoff_50 = median(Port_MKT_CAP, na.rm=T),
+    BV_MV_30 = quantile(BV_MV, probs=0.30, na.rm=T),
+    BV_MV_70 = quantile(BV_MV, probs=0.70, na.rm=T)
+  )
+
+unfiltered_cutoffs <- crsp_compustat_combined %>%
+  select(Date, Prof_Acc, Prof_Cash, at_growth, MOM_RET) %>% 
+  group_by(Date) %>% 
+  summarise(
+    Prof_Acc_30 = quantile(Prof_Acc, probs=0.30, na.rm=T),
+    Prof_Acc_70 = quantile(Prof_Acc, probs=0.70, na.rm=T),
+    Prof_Cash_30 = quantile(Prof_Cash, probs=0.30, na.rm=T),
+    Prof_Cash_70 = quantile(Prof_Cash, probs=0.70, na.rm=T),
+    at_growth_30 = quantile(at_growth, probs=0.30, na.rm=T),
+    at_growth_70 = quantile(at_growth, probs=0.70, na.rm=T),
+    MOM_RET_30 = quantile(MOM_RET, probs=0.30, na.rm=T),
+    MOM_RET_70 = quantile(MOM_RET, probs=0.70, na.rm=T)
+    )
+
+cutoffs <- nyse_filtered_cutoffs %>% 
+  inner_join(unfiltered_cutoffs, by='Date')
+
+rm(nyse_filtered_cutoffs, unfiltered_cutoffs)
+```
+
+
+```{r}
+crsp_compustat_combined <- crsp_compustat_combined %>% 
+  inner_join(cutoffs, by='Date')
+```
+
+
+`*************************************************************************************************************`
+
+## Flags for Each Stock and Each Month
+
+```{r}
+portfolio_flags <- crsp_compustat_combined %>% 
+  ungroup() %>% 
+  mutate(
+    Size = case_when(Port_MKT_CAP <= size_cutoff_50  ~ 'S',
+                     Port_MKT_CAP > size_cutoff_50  ~ 'B',
+                     TRUE ~ ''),
+    Value = case_when(BV_MV <= BV_MV_30  ~ 'L',
+                      BV_MV_30 < BV_MV & BV_MV <= BV_MV_70  ~ 'N',
+                      BV_MV > BV_MV_70  ~ 'H',
+                      TRUE ~ ''),
+    
+    Prof_A = case_when(Prof_Acc <= Prof_Acc_30  ~ 'W',
+                      Prof_Acc_30 < Prof_Acc & Prof_Acc <= Prof_Acc_70  ~ 'N',
+                      Prof_Acc > Prof_Acc_70  ~ 'R',
+                      TRUE ~ ''),
+    Prof_C = case_when(Prof_Cash <= Prof_Cash_30  ~ 'W',
+                      Prof_Cash_30 < Prof_Cash & Prof_Cash <= Prof_Cash_70  ~ 'N',
+                      Prof_Cash_70 < Prof_Cash ~ 'R',
+                      TRUE ~ ''),
+    Inv = case_when(at_growth <= at_growth_30  ~ 'C',
+                    at_growth_30 < at_growth & at_growth <= at_growth_70  ~ 'N',
+                    at_growth > at_growth_70  ~ 'A',
+                    TRUE ~ ''),
+    Mom = case_when(MOM_RET <= MOM_RET_30  ~ 'D',
+                    MOM_RET_30 < MOM_RET & MOM_RET <= MOM_RET_70  ~ 'N',
+                    MOM_RET > MOM_RET_70  ~ 'U',
+                    TRUE ~ '')
+    ) %>% 
+  select(CUSIP, Port_Start_Year, Date, Port_MKT_CAP, RET, Size, Value, Prof_A, Prof_C, Inv, Mom)
+```
+
+## Portfolio Returns
+
+### Market Return
+
+```{r}
+mkt_ret <- crsp_compustat_combined %>% 
+  select(Date, RF, VWRETD) %>% 
+  rename(MKT=VWRETD) %>% 
+  unique() %>% 
+  arrange(Date)
+```
+
+### 6 Market Cap Portfolios Formed Based on Size and book-to-market
+
+```{r}
+S_H <- portfolio_flags %>% 
+  filter(Size=='S', Value=='H') %>% 
+  group_by(Date) %>%
+  summarise(S_H = weighted.mean(RET,Port_MKT_CAP))
+
+S_N_VAL <- portfolio_flags %>% 
+  filter(Size=='S', Value=='N') %>% 
+  group_by(Date) %>%
+  summarise(S_N_VAL = weighted.mean(RET,Port_MKT_CAP))
+
+S_L <- portfolio_flags %>% 
+  filter(Size=='S', Value=='L') %>% 
+  group_by(Date) %>%
+  summarise(S_L = weighted.mean(RET,Port_MKT_CAP))
+
+B_H <- portfolio_flags %>% 
+  filter(Size=='B', Value=='H') %>% 
+  group_by(Date) %>%
+  summarise(B_H = weighted.mean(RET,Port_MKT_CAP))
+
+B_N_VAL <- portfolio_flags %>% 
+  filter(Size=='B', Value=='N') %>% 
+  group_by(Date) %>%
+  summarise(B_N_VAL = weighted.mean(RET,Port_MKT_CAP))
+
+B_L <- portfolio_flags %>% 
+  filter(Size=='B', Value=='L') %>% 
+  group_by(Date) %>%
+  summarise(B_L = weighted.mean(RET,Port_MKT_CAP))
+
+df_list <- list(S_H, S_N_VAL, S_L, B_H, B_N_VAL, B_L)
+value_ret <- df_list %>% reduce(full_join, by='Date')
+rm(S_H, S_N_VAL, S_L, B_H, B_N_VAL, B_L, df_list)
+```
+
+### 6 Market Cap Weighted Portfolios Formed Based on Size and Profitability (Accrual Based)
+
+```{r}
+S_R_A <- portfolio_flags %>% 
+  filter(Size=='S', Prof_A=='R') %>% 
+  group_by(Date) %>%
+  summarise(S_R_A = weighted.mean(RET,Port_MKT_CAP))
+
+S_N_Prof_A <- portfolio_flags %>% 
+  filter(Size=='S', Prof_A=='N') %>% 
+  group_by(Date) %>%
+  summarise(S_N_Prof_A = weighted.mean(RET,Port_MKT_CAP))
+
+S_W_A <- portfolio_flags %>% 
+  filter(Size=='S', Prof_A=='W') %>% 
+  group_by(Date) %>%
+  summarise(S_W_A = weighted.mean(RET,Port_MKT_CAP))
+
+B_R_A <- portfolio_flags %>% 
+  filter(Size=='B', Prof_A=='R') %>% 
+  group_by(Date) %>%
+  summarise(B_R_A = weighted.mean(RET,Port_MKT_CAP))
+
+B_N_Prof_A <- portfolio_flags %>% 
+  filter(Size=='B', Prof_A=='N') %>% 
+  group_by(Date) %>%
+  summarise(B_N_Prof_A = weighted.mean(RET,Port_MKT_CAP))
+
+B_W_A <- portfolio_flags %>% 
+  filter(Size=='B', Prof_A=='W') %>% 
+  group_by(Date) %>%
+  summarise(B_W_A = weighted.mean(RET,Port_MKT_CAP))
+
+df_list <- list(S_R_A, S_N_Prof_A, S_W_A, B_R_A, B_N_Prof_A, B_W_A)
+prof_a_ret <- df_list %>% reduce(full_join, by='Date')
+rm(S_R_A, S_N_Prof_A, S_W_A, B_R_A, B_N_Prof_A, B_W_A, df_list)
+```
+
+### 6 Market Cap Weighted Portfolios Formed Based on Size and Profitability (Cash Based)
+
+```{r}
+S_R_C <- portfolio_flags %>% 
+  filter(Size=='S', Prof_C=='R') %>% 
+  group_by(Date) %>%
+  summarise(S_R_C = weighted.mean(RET,Port_MKT_CAP))
+
+S_N_Prof_C <- portfolio_flags %>% 
+  filter(Size=='S', Prof_C=='N') %>% 
+  group_by(Date) %>%
+  summarise(S_N_Prof_C = weighted.mean(RET,Port_MKT_CAP))
+
+S_W_C <- portfolio_flags %>% 
+  filter(Size=='S', Prof_C=='W') %>% 
+  group_by(Date) %>%
+  summarise(S_W_C = weighted.mean(RET,Port_MKT_CAP))
+
+B_R_C <- portfolio_flags %>% 
+  filter(Size=='B', Prof_C=='R') %>% 
+  group_by(Date) %>%
+  summarise(B_R_C = weighted.mean(RET,Port_MKT_CAP))
+
+B_N_Prof_C <- portfolio_flags %>% 
+  filter(Size=='B', Prof_C=='N') %>% 
+  group_by(Date) %>%
+  summarise(B_N_Prof_C = weighted.mean(RET,Port_MKT_CAP))
+
+B_W_C <- portfolio_flags %>% 
+  filter(Size=='B', Prof_C=='W') %>% 
+  group_by(Date) %>%
+  summarise(B_W_C = weighted.mean(RET,Port_MKT_CAP))
+
+df_list <- list(S_R_C, S_N_Prof_C, S_W_C, B_R_C, B_N_Prof_C, B_W_C)
+prof_c_ret <- df_list %>% reduce(full_join, by='Date')
+rm(S_R_C, S_N_Prof_C, S_W_C, B_R_C, B_N_Prof_C, B_W_C, df_list)
+```
+
+### 6 Market Cap Portfolios Formed Based on Size and Investment Rate
+
+```{r}
+S_C <- portfolio_flags %>% 
+  filter(Size=='S', Inv=='C') %>% 
+  group_by(Date) %>%
+  summarise(S_C = weighted.mean(RET,Port_MKT_CAP))
+
+S_N_INV <- portfolio_flags %>% 
+  filter(Size=='S', Inv=='N') %>% 
+  group_by(Date) %>%
+  summarise(S_N_INV = weighted.mean(RET,Port_MKT_CAP))
+
+S_A <- portfolio_flags %>% 
+  filter(Size=='S', Inv=='A') %>% 
+  group_by(Date) %>%
+  summarise(S_A = weighted.mean(RET,Port_MKT_CAP))
+
+B_C <- portfolio_flags %>% 
+  filter(Size=='B', Inv=='C') %>% 
+  group_by(Date) %>%
+  summarise(B_C = weighted.mean(RET,Port_MKT_CAP))
+
+B_N_INV <- portfolio_flags %>% 
+  filter(Size=='B', Inv=='N') %>% 
+  group_by(Date) %>%
+  summarise(B_N_INV = weighted.mean(RET,Port_MKT_CAP))
+
+B_A <- portfolio_flags %>% 
+  filter(Size=='B', Inv=='A') %>% 
+  group_by(Date) %>%
+  summarise(B_A = weighted.mean(RET,Port_MKT_CAP))
+
+df_list <- list(S_C, S_N_INV, S_A, B_C, B_N_INV, B_A)
+inv_ret <- df_list %>% reduce(full_join, by='Date')
+rm(S_C, S_N_INV, S_A, B_C, B_N_INV, B_A, df_list)
+```
+
+### 6 Market Cap Portfolios Formed Based on Size and Momentum
+
+```{r}
+S_U <- portfolio_flags %>% 
+  filter(Size=='S', Mom=='U') %>% 
+  group_by(Date) %>%
+  summarise(S_U = weighted.mean(RET,Port_MKT_CAP))
+
+S_N_MOM <- portfolio_flags %>% 
+  filter(Size=='S', Mom=='N') %>% 
+  group_by(Date) %>%
+  summarise(S_N_MOM = weighted.mean(RET,Port_MKT_CAP))
+
+S_D <- portfolio_flags %>% 
+  filter(Size=='S', Mom=='D') %>% 
+  group_by(Date) %>%
+  summarise(S_D = weighted.mean(RET,Port_MKT_CAP))
+
+B_U <- portfolio_flags %>% 
+  filter(Size=='B', Mom=='U') %>% 
+  group_by(Date) %>%
+  summarise(B_U = weighted.mean(RET,Port_MKT_CAP))
+
+B_N_MOM <- portfolio_flags %>% 
+  filter(Size=='B', Mom=='N') %>% 
+  group_by(Date) %>%
+  summarise(B_N_MOM = weighted.mean(RET,Port_MKT_CAP))
+
+B_D <- portfolio_flags %>% 
+  filter(Size=='B', Mom=='D') %>% 
+  group_by(Date) %>%
+  summarise(B_D = weighted.mean(RET,Port_MKT_CAP))
+
+df_list <- list(S_U, S_N_MOM, S_D, B_U, B_N_MOM, B_D)
+mom_ret <- df_list %>% reduce(full_join, by='Date')
+rm(S_U, S_N_MOM, S_D, B_U, B_N_MOM, B_D, df_list)
+```
+
+
+### Joining Factor Portfolio Returns
+
+```{r}
+ff_port_ret <- mkt_ret %>% 
+  inner_join(value_ret, by = 'Date') %>%
+  inner_join(prof_a_ret, by = 'Date') %>%
+  inner_join(prof_c_ret, by = 'Date') %>%
+  inner_join(inv_ret, by = 'Date') %>% 
+  inner_join(mom_ret, by = 'Date')
+
+# rm(mkt_ret, value_ret, prof_a_ret, prof_c_ret, inv_ret, mom_ret)
+```
+
+```{r}
+factor_ret <- ff_port_ret %>% 
+  
+  mutate(
+    S = (1/9) * (S_H + S_N_VAL + S_L + S_R_A + S_N_Prof_A + S_W_A + S_C + S_N_INV + S_A),     
+    B = (1/9) * (B_H + B_N_VAL + B_L + B_R_A + B_N_Prof_A + B_W_A + B_C + B_N_INV + B_A),
+    SMB = S - B,
+    
+    H = (1/2) * (S_H + B_H),
+    L = (1/2) * (S_L + B_L),
+    HML = H - L,
+    H_S = S_H,
+    L_S = S_L,
+    H_B = B_H,
+    L_B = B_L,
+    HML_S = H_S - L_S,
+    HML_B = H_B - L_B,
+    HML_SMB = HML_S - HML_B,
+    R_A = (1/2) * (S_R_A + B_R_A),
+    W_A = (1/2) * (S_W_A + B_W_A),
+    RMW_A = R_A - W_A,
+    R_A_S = S_R_A,
+    W_A_S = S_W_A,
+    R_A_B = B_R_A,
+    W_A_B = B_W_A,
+    RMW_A_S = R_A_S - W_A_S,
+    RMW_A_B = R_A_B - W_A_B,
+    RMW_A_SMB = RMW_A_S - RMW_A_B,
+    
+    R_C = (1/2) * (S_R_C + B_R_C),
+    W_C = (1/2) * (S_W_C + B_W_C),
+    RMW_C = R_C - W_C,
+    R_C_S = S_R_C,
+    W_C_S = S_W_C,
+    R_C_B = B_R_C,
+    W_C_B = B_W_C,
+    RMW_C_S = R_C_S - W_C_S,
+    RMW_C_B = R_C_B - W_C_B,
+    RMW_C_SMB = RMW_C_S - RMW_C_B,
+    
+    C = (1/2) * (S_C + B_C),
+    A = (1/2) * (S_A + B_A),
+    CMA = C - A,
+    C_S = S_C,
+    A_S = S_A,
+    C_B = B_C,
+    A_B = B_A,
+    CMA_S = C_S - A_S,
+    CMA_B = C_B - A_B,
+    CMA_SMB = CMA_S - CMA_B,
+    
+    U = (1/2) * (S_U + B_U),
+    D = (1/2) * (S_D + B_D),
+    UMD = U - D,
+    U_S = S_U,
+    D_S = S_D,
+    U_B = B_U,
+    D_B = B_D,
+    UMD_S = U_S - D_S,
+    UMD_B = U_B - D_B,
+    UMD_SMB = UMD_S - UMD_B
+    
+  ) %>% 
+  select(Date, RF, MKT, S:UMD_SMB)
+```
+
+```{r}
+# For debugging
+df <- factor_ret %>% 
+  mutate(Date = as.Date(Date, frac=1))
+fwrite(df, "../../Output/Factor_Returns.csv")
+```
+
+
+
+
+
+
